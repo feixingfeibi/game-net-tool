@@ -222,37 +222,29 @@ class NetworkController:
                 return "限速功能需要 WinDivert，请先点击「一键安装」"
             return self._start_firewall(exe_path, up_action, down_action)
 
-    # ── WinDivert 模式 (拦截数据包，即时生效) ──
+    # ── WinDivert 模式 (拦截全部流量，逐包判断进程归属) ──
 
     def _start_divert(self, pid: int,
                       up_action: str, down_action: str,
                       up_kbps: float, down_kbps: float) -> str:
+        # 验证进程存在
         try:
-            conns = psutil.Process(pid).net_connections()
+            psutil.Process(pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return "无法读取进程网络连接，请检查进程是否存在"
-
-        ports: Set[int] = {c.laddr.port for c in conns if c.laddr}
-        if not ports:
-            return "该进程当前没有活跃的网络连接"
-
-        filt = self._port_filter(ports)
-        if not filt:
-            return "无法构建过滤规则"
+            return "进程不存在或无权限访问"
 
         self._active = True
         self._thread = threading.Thread(
             target=self._divert_loop,
-            args=(pid, ports, filt, up_action, down_action, up_kbps, down_kbps),
+            args=(pid, up_action, down_action, up_kbps, down_kbps),
             daemon=True,
         )
         self._thread.start()
         return ""
 
-    def _divert_loop(self, pid: int, ports: Set[int], filt: str,
+    def _divert_loop(self, pid: int,
                      up_action: str, down_action: str,
                      up_kbps: float, down_kbps: float):
-        # 创建限速桶 (仅 throttle 模式需要)
         up_bucket = (
             TokenBucket(up_kbps * 1024)
             if up_action == ACTION_THROTTLE and up_kbps > 0 else None
@@ -262,25 +254,39 @@ class NetworkController:
             if down_action == ACTION_THROTTLE and down_kbps > 0 else None
         )
 
+        # 目标进程的端口集合 (由刷新线程维护)
+        target_ports: Set[int] = set()
+        ports_lock = threading.Lock()
+
+        def port_refresher():
+            """后台线程: 每 0.5 秒刷新目标进程的端口列表"""
+            while self._active:
+                try:
+                    new_ports = {
+                        c.laddr.port
+                        for c in psutil.Process(pid).net_connections()
+                        if c.laddr
+                    }
+                    with ports_lock:
+                        target_ports.clear()
+                        target_ports.update(new_ports)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+        refresher = threading.Thread(target=port_refresher, daemon=True)
+        refresher.start()
+        # 等待首次端口扫描完成
+        time.sleep(0.3)
+
         try:
-            with pydivert.WinDivert(filt) as w:
+            # 拦截所有 TCP/UDP 流量，在代码中判断归属
+            with pydivert.WinDivert("tcp or udp") as w:
                 self._divert_handle = w
-                last_refresh = time.monotonic()
 
                 while self._active:
-                    # 定期刷新端口列表
-                    if time.monotonic() - last_refresh > 3:
-                        try:
-                            new_ports = {
-                                c.laddr.port
-                                for c in psutil.Process(pid).net_connections()
-                                if c.laddr
-                            }
-                            ports.update(new_ports)
-                        except Exception:
-                            pass
-                        last_refresh = time.monotonic()
-
                     try:
                         pkt = w.recv()
                     except Exception:
@@ -288,7 +294,21 @@ class NetworkController:
                             break
                         continue
 
-                    # 判断方向并执行动作
+                    # 判断这个包是否属于目标进程
+                    local_port = pkt.src_port if pkt.is_outbound else pkt.dst_port
+
+                    with ports_lock:
+                        is_target = local_port in target_ports
+
+                    if not is_target:
+                        # 不是目标进程的包，立即放行
+                        try:
+                            w.send(pkt)
+                        except Exception:
+                            pass
+                        continue
+
+                    # 是目标进程的包，执行对应动作
                     if pkt.is_outbound:
                         action = up_action
                         bucket = up_bucket
@@ -297,12 +317,11 @@ class NetworkController:
                         bucket = down_bucket
 
                     if action == ACTION_DROP:
-                        continue  # 直接丢弃，不 send
+                        continue  # 丢弃
 
                     if action == ACTION_THROTTLE and bucket:
                         bucket.consume(len(pkt.raw))
 
-                    # pass 或 throttle 后放行
                     try:
                         w.send(pkt)
                     except Exception:
@@ -374,19 +393,6 @@ class NetworkController:
         self._thread = None
         self._clear_fw_rules()
 
-    # ── 工具 ──
-
-    @staticmethod
-    def _port_filter(ports: Set[int]) -> str:
-        if not ports:
-            return ""
-        conds = []
-        for p in ports:
-            conds += [
-                f"tcp.SrcPort == {p}", f"tcp.DstPort == {p}",
-                f"udp.SrcPort == {p}", f"udp.DstPort == {p}",
-            ]
-        return f"({' or '.join(conds)})"
 
 
 # ─── 进程信息 ───────────────────────────────────────────────
