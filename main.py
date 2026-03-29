@@ -63,13 +63,11 @@ class WinDivertInstaller:
     WINDIVERT_URL = (
         "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
     )
-    WINDIVERT_DIR = "WinDivert-2.2.2-A"
     NEEDED_FILES_64 = ["WinDivert.dll", "WinDivert64.sys"]
     NEEDED_FILES_32 = ["WinDivert.dll", "WinDivert32.sys"]
 
     @classmethod
     def is_driver_installed(cls) -> bool:
-        """检查 WinDivert DLL/SYS 是否在程序目录"""
         base = app_dir()
         return os.path.isfile(os.path.join(base, "WinDivert.dll")) and (
             os.path.isfile(os.path.join(base, "WinDivert64.sys"))
@@ -86,16 +84,10 @@ class WinDivertInstaller:
 
     @classmethod
     def install_all(cls, progress_cb=None) -> str:
-        """
-        一键安装 pydivert + WinDivert 驱动文件。
-        progress_cb(message: str) 用于回报进度。
-        返回空字符串表示成功，否则返回错误信息。
-        """
         def log(msg):
             if progress_cb:
                 progress_cb(msg)
 
-        # 1) pip install pydivert
         if not cls.is_pydivert_installed():
             log("正在安装 pydivert 库...")
             try:
@@ -109,7 +101,6 @@ class WinDivertInstaller:
             except FileNotFoundError:
                 return "未找到 pip，请确认 Python 环境完整"
 
-        # 2) 下载 WinDivert
         if not cls.is_driver_installed():
             base = app_dir()
             zip_path = os.path.join(base, "windivert_tmp.zip")
@@ -121,17 +112,14 @@ class WinDivertInstaller:
             except (URLError, OSError) as e:
                 return f"下载失败: {e}"
 
-            # 3) 解压并复制文件
             log("正在解压...")
             try:
                 with zipfile.ZipFile(zip_path, "r") as zf:
                     zf.extractall(extract_dir)
 
-                # 找到正确的子目录 (x64 或 x86)
                 is_64 = sys.maxsize > 2**32
                 needed = cls.NEEDED_FILES_64 if is_64 else cls.NEEDED_FILES_32
 
-                # 在解压目录中搜索所需文件
                 found = {}
                 for root_d, _dirs, files in os.walk(extract_dir):
                     for f in files:
@@ -144,15 +132,13 @@ class WinDivertInstaller:
 
                 log("正在复制驱动文件...")
                 for fname, src_path in found.items():
-                    dst = os.path.join(base, fname)
-                    shutil.copy2(src_path, dst)
+                    shutil.copy2(src_path, os.path.join(base, fname))
 
             except zipfile.BadZipFile:
                 return "下载的文件损坏，请重试"
             except OSError as e:
                 return f"文件操作失败: {e}"
             finally:
-                # 清理临时文件
                 try:
                     os.remove(zip_path)
                 except OSError:
@@ -197,101 +183,93 @@ class TokenBucket:
 
 # ─── 网络控制器 ─────────────────────────────────────────────
 
+# 每个方向的动作
+ACTION_PASS = "pass"        # 放行
+ACTION_DROP = "drop"        # 丢弃
+ACTION_THROTTLE = "throttle"  # 限速
+
+
 class NetworkController:
-    """通过 Windows 防火墙封锁 + WinDivert 限速"""
+    """
+    优先使用 WinDivert 拦截数据包 (即时生效)。
+    WinDivert 不可用时降级为 Windows 防火墙 (仅封锁模式)。
+    """
 
     RULE_PREFIX = "GameNetTool_"
 
     def __init__(self):
         self.active_rules: List[str] = []
-        self.throttle_active = False
-        self._throttle_thread: Optional[threading.Thread] = None
+        self._active = False
+        self._thread: Optional[threading.Thread] = None
         self._divert_handle = None
 
-    # ── 防火墙封锁 ──
+    # ── 统一启动接口 ──
 
-    def block(self, exe_path: str, block_up: bool, block_down: bool) -> bool:
-        self.unblock()
-        name = os.path.basename(exe_path)
-        try:
-            if block_up:
-                rule = f"{self.RULE_PREFIX}OUT_{name}"
-                self._fw_add(rule, "out", exe_path)
-                self.active_rules.append(rule)
-            if block_down:
-                rule = f"{self.RULE_PREFIX}IN_{name}"
-                self._fw_add(rule, "in", exe_path)
-                self.active_rules.append(rule)
-            return True
-        except Exception as e:
-            print(f"Firewall error: {e}")
-            return False
+    def start(self, pid: int, exe_path: str,
+              up_action: str, down_action: str,
+              up_kbps: float = 0, down_kbps: float = 0) -> str:
+        """
+        启动网络控制。返回空字符串=成功，否则返回错误/提示信息。
+        up_action/down_action: ACTION_PASS / ACTION_DROP / ACTION_THROTTLE
+        """
+        self.stop()
 
-    def unblock(self):
-        for rule in self.active_rules:
-            try:
-                subprocess.run(
-                    ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"],
-                    capture_output=True,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except Exception:
-                pass
-        self.active_rules.clear()
+        if HAS_WINDIVERT:
+            return self._start_divert(pid, up_action, down_action, up_kbps, down_kbps)
+        else:
+            # 降级: 防火墙只能做封锁，不能限速
+            if up_action == ACTION_THROTTLE or down_action == ACTION_THROTTLE:
+                return "限速功能需要 WinDivert，请先点击「一键安装」"
+            return self._start_firewall(exe_path, up_action, down_action)
 
-    @staticmethod
-    def _fw_add(rule_name: str, direction: str, exe_path: str):
-        subprocess.run(
-            [
-                "netsh", "advfirewall", "firewall", "add", "rule",
-                f"name={rule_name}", f"dir={direction}",
-                f"program={exe_path}", "action=block",
-            ],
-            capture_output=True, check=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+    # ── WinDivert 模式 (拦截数据包，即时生效) ──
 
-    # ── WinDivert 限速 ──
-
-    def start_throttle(self, pid: int, up_kbps: float, down_kbps: float) -> bool:
-        if not HAS_WINDIVERT:
-            return False
-        self.stop_throttle()
-
+    def _start_divert(self, pid: int,
+                      up_action: str, down_action: str,
+                      up_kbps: float, down_kbps: float) -> str:
         try:
             conns = psutil.Process(pid).net_connections()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return False
+            return "无法读取进程网络连接，请检查进程是否存在"
 
         ports: Set[int] = {c.laddr.port for c in conns if c.laddr}
         if not ports:
-            return False
-
-        self.throttle_active = True
-        self._throttle_thread = threading.Thread(
-            target=self._throttle_loop,
-            args=(pid, ports, up_kbps, down_kbps),
-            daemon=True,
-        )
-        self._throttle_thread.start()
-        return True
-
-    def _throttle_loop(self, pid: int, ports: Set[int],
-                       up_kbps: float, down_kbps: float):
-        up_bucket = TokenBucket(up_kbps * 1024) if up_kbps > 0 else None
-        down_bucket = TokenBucket(down_kbps * 1024) if down_kbps > 0 else None
+            return "该进程当前没有活跃的网络连接"
 
         filt = self._port_filter(ports)
         if not filt:
-            return
+            return "无法构建过滤规则"
+
+        self._active = True
+        self._thread = threading.Thread(
+            target=self._divert_loop,
+            args=(pid, ports, filt, up_action, down_action, up_kbps, down_kbps),
+            daemon=True,
+        )
+        self._thread.start()
+        return ""
+
+    def _divert_loop(self, pid: int, ports: Set[int], filt: str,
+                     up_action: str, down_action: str,
+                     up_kbps: float, down_kbps: float):
+        # 创建限速桶 (仅 throttle 模式需要)
+        up_bucket = (
+            TokenBucket(up_kbps * 1024)
+            if up_action == ACTION_THROTTLE and up_kbps > 0 else None
+        )
+        down_bucket = (
+            TokenBucket(down_kbps * 1024)
+            if down_action == ACTION_THROTTLE and down_kbps > 0 else None
+        )
 
         try:
             with pydivert.WinDivert(filt) as w:
                 self._divert_handle = w
                 last_refresh = time.monotonic()
-                while self.throttle_active:
+
+                while self._active:
                     # 定期刷新端口列表
-                    if time.monotonic() - last_refresh > 5:
+                    if time.monotonic() - last_refresh > 3:
                         try:
                             new_ports = {
                                 c.laddr.port
@@ -306,23 +284,97 @@ class NetworkController:
                     try:
                         pkt = w.recv()
                     except Exception:
-                        if not self.throttle_active:
+                        if not self._active:
                             break
                         continue
 
-                    if pkt.is_outbound and up_bucket:
-                        up_bucket.consume(len(pkt.raw))
-                    elif not pkt.is_outbound and down_bucket:
-                        down_bucket.consume(len(pkt.raw))
+                    # 判断方向并执行动作
+                    if pkt.is_outbound:
+                        action = up_action
+                        bucket = up_bucket
+                    else:
+                        action = down_action
+                        bucket = down_bucket
 
+                    if action == ACTION_DROP:
+                        continue  # 直接丢弃，不 send
+
+                    if action == ACTION_THROTTLE and bucket:
+                        bucket.consume(len(pkt.raw))
+
+                    # pass 或 throttle 后放行
                     try:
                         w.send(pkt)
                     except Exception:
                         pass
+
         except Exception as e:
             print(f"WinDivert error: {e}")
         finally:
             self._divert_handle = None
+
+    # ── 防火墙降级模式 ──
+
+    def _start_firewall(self, exe_path: str,
+                        up_action: str, down_action: str) -> str:
+        self._clear_fw_rules()
+        name = os.path.basename(exe_path)
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            if up_action == ACTION_DROP:
+                rule = f"{self.RULE_PREFIX}OUT_{name}"
+                r = subprocess.run(
+                    ["netsh", "advfirewall", "firewall", "add", "rule",
+                     f"name={rule}", "dir=out", f"program={exe_path}", "action=block"],
+                    capture_output=True, creationflags=no_window,
+                )
+                if r.returncode != 0:
+                    return f"防火墙添加失败: {r.stderr.decode(errors='ignore')}"
+                self.active_rules.append(rule)
+
+            if down_action == ACTION_DROP:
+                rule = f"{self.RULE_PREFIX}IN_{name}"
+                r = subprocess.run(
+                    ["netsh", "advfirewall", "firewall", "add", "rule",
+                     f"name={rule}", "dir=in", f"program={exe_path}", "action=block"],
+                    capture_output=True, creationflags=no_window,
+                )
+                if r.returncode != 0:
+                    return f"防火墙添加失败: {r.stderr.decode(errors='ignore')}"
+                self.active_rules.append(rule)
+
+            self._active = True
+            return "[防火墙模式] 已建立的连接可能不会立即断开，建议安装 WinDivert"
+        except Exception as e:
+            return f"防火墙操作异常: {e}"
+
+    def _clear_fw_rules(self):
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for rule in self.active_rules:
+            try:
+                subprocess.run(
+                    ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"],
+                    capture_output=True, creationflags=no_window,
+                )
+            except Exception:
+                pass
+        self.active_rules.clear()
+
+    # ── 停止 ──
+
+    def stop(self):
+        self._active = False
+        if self._divert_handle:
+            try:
+                self._divert_handle.close()
+            except Exception:
+                pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._thread = None
+        self._clear_fw_rules()
+
+    # ── 工具 ──
 
     @staticmethod
     def _port_filter(ports: Set[int]) -> str:
@@ -335,21 +387,6 @@ class NetworkController:
                 f"udp.SrcPort == {p}", f"udp.DstPort == {p}",
             ]
         return f"({' or '.join(conds)})"
-
-    def stop_throttle(self):
-        self.throttle_active = False
-        if self._divert_handle:
-            try:
-                self._divert_handle.close()
-            except Exception:
-                pass
-        if self._throttle_thread and self._throttle_thread.is_alive():
-            self._throttle_thread.join(timeout=3)
-        self._throttle_thread = None
-
-    def stop_all(self):
-        self.unblock()
-        self.stop_throttle()
 
 
 # ─── 进程信息 ───────────────────────────────────────────────
@@ -369,8 +406,8 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("游戏网络工具箱")
-        self.geometry("560x720")
-        self.minsize(480, 640)
+        self.geometry("560x750")
+        self.minsize(480, 660)
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -414,7 +451,7 @@ class App(ctk.CTk):
             fill="x", padx=10, pady=4
         )
 
-        self._list_frame = ctk.CTkScrollableFrame(pf, height=160)
+        self._list_frame = ctk.CTkScrollableFrame(pf, height=150)
         self._list_frame.pack(fill="x", padx=10, pady=(0, 10))
         self._list_btns: List[ctk.CTkButton] = []
 
@@ -438,7 +475,7 @@ class App(ctk.CTk):
                 command=self._mode_changed,
             ).pack(anchor="w", padx=20, pady=2)
 
-        # 速度设置 (内嵌 cf)
+        # 速度设置 (内嵌 cf，默认隐藏)
         self._speed_frame = ctk.CTkFrame(cf, fg_color="transparent")
 
         sg = ctk.CTkFrame(self._speed_frame, fg_color="transparent")
@@ -458,13 +495,17 @@ class App(ctk.CTk):
         self._down_unlim = ctk.BooleanVar()
         ctk.CTkCheckBox(sg, text="无限制", variable=self._down_unlim).grid(row=1, column=3, padx=8, pady=4)
 
-        # WinDivert 安装状态区域
-        self._wd_status_frame = ctk.CTkFrame(self._speed_frame, fg_color="transparent")
-        self._wd_status_frame.pack(fill="x", padx=20, pady=(2, 4))
-        self._refresh_windivert_status()
+        # ── WinDivert 状态 (所有模式都需要) ──
+        wd_frame = ctk.CTkFrame(root)
+        wd_frame.pack(fill="x", pady=(0, 8))
 
-        # 速度面板默认隐藏
-        # (不 pack self._speed_frame)
+        wd_hdr = ctk.CTkFrame(wd_frame, fg_color="transparent")
+        wd_hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ctk.CTkLabel(wd_hdr, text="WinDivert 驱动", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+
+        self._wd_status_frame = ctk.CTkFrame(wd_frame, fg_color="transparent")
+        self._wd_status_frame.pack(fill="x", padx=20, pady=(0, 8))
+        self._refresh_windivert_status()
 
         # ── 快捷键 ──
         hf = ctk.CTkFrame(root)
@@ -576,38 +617,60 @@ class App(ctk.CTk):
             return
 
         mode = self._mode.get()
-        ok = False
 
-        if mode == "throttle":
-            if not HAS_WINDIVERT:
-                self._set_status("请先点击「一键安装」安装 WinDivert!", "#ff6666")
-                return
-            up = 0 if self._up_unlim.get() else self._parse_float(self._up_speed.get())
-            dn = 0 if self._down_unlim.get() else self._parse_float(self._down_speed.get())
-            ok = self.ctrl.start_throttle(self.selected.pid, up, dn)
-            if ok:
-                desc = (
-                    f"上行 {'无限制' if up == 0 else f'{up} KB/s'} | "
-                    f"下行 {'无限制' if dn == 0 else f'{dn} KB/s'}"
-                )
-                self._set_status(f"限速中: {desc}", "#66ff66")
-        else:
-            up_block = mode in ("block_both", "block_up")
-            dn_block = mode in ("block_both", "block_down")
-            ok = self.ctrl.block(exe, up_block, dn_block)
-            if ok:
-                labels = {"block_both": "完全断网", "block_up": "禁止上行", "block_down": "禁止下行"}
-                self._set_status(f"已启用: {labels[mode]} - {self.selected.name}", "#66ff66")
+        # 根据模式确定每个方向的动作
+        if mode == "block_both":
+            up_act, down_act = ACTION_DROP, ACTION_DROP
+            up_kbps, down_kbps = 0, 0
+        elif mode == "block_up":
+            up_act, down_act = ACTION_DROP, ACTION_PASS
+            up_kbps, down_kbps = 0, 0
+        elif mode == "block_down":
+            up_act, down_act = ACTION_PASS, ACTION_DROP
+            up_kbps, down_kbps = 0, 0
+        else:  # throttle
+            up_act = ACTION_PASS if self._up_unlim.get() else ACTION_THROTTLE
+            down_act = ACTION_PASS if self._down_unlim.get() else ACTION_THROTTLE
+            up_kbps = 0 if self._up_unlim.get() else self._parse_float(self._up_speed.get())
+            down_kbps = 0 if self._down_unlim.get() else self._parse_float(self._down_speed.get())
 
-        if ok:
+        err = self.ctrl.start(
+            self.selected.pid, exe,
+            up_act, down_act, up_kbps, down_kbps,
+        )
+
+        if not err:
+            # 成功
             self.active = True
             self._btn_start.configure(state="disabled")
             self._btn_stop.configure(state="normal")
+
+            labels = {
+                "block_both": "完全断网",
+                "block_up": "禁止上行",
+                "block_down": "禁止下行",
+            }
+            if mode == "throttle":
+                up_desc = "无限制" if up_act == ACTION_PASS else f"{up_kbps} KB/s"
+                dn_desc = "无限制" if down_act == ACTION_PASS else f"{down_kbps} KB/s"
+                self._set_status(f"限速中: 上行 {up_desc} | 下行 {dn_desc}", "#66ff66")
+            else:
+                engine = "WinDivert" if HAS_WINDIVERT else "防火墙"
+                self._set_status(
+                    f"已启用 [{engine}]: {labels[mode]} - {self.selected.name}",
+                    "#66ff66",
+                )
+        elif err.startswith("[防火墙模式]"):
+            # 防火墙降级成功但有警告
+            self.active = True
+            self._btn_start.configure(state="disabled")
+            self._btn_stop.configure(state="normal")
+            self._set_status(err, "#ffaa33")
         else:
-            self._set_status("操作失败，请确认管理员权限!", "#ff6666")
+            self._set_status(f"失败: {err}", "#ff6666")
 
     def _deactivate(self):
-        self.ctrl.stop_all()
+        self.ctrl.stop()
         self.active = False
         self._btn_start.configure(state="normal")
         self._btn_stop.configure(state="disabled")
@@ -642,7 +705,6 @@ class App(ctk.CTk):
     # ── WinDivert 安装 ──
 
     def _refresh_windivert_status(self):
-        """刷新 WinDivert 安装状态显示"""
         for w in self._wd_status_frame.winfo_children():
             w.destroy()
 
@@ -652,10 +714,9 @@ class App(ctk.CTk):
         if has_pydivert and has_driver:
             ctk.CTkLabel(
                 self._wd_status_frame,
-                text="WinDivert 已就绪",
-                text_color="#66ff66", font=ctk.CTkFont(size=11),
+                text="已就绪 - 所有功能可用",
+                text_color="#66ff66", font=ctk.CTkFont(size=12),
             ).pack(side="left")
-            # 热加载 pydivert
             global HAS_WINDIVERT
             if not HAS_WINDIVERT:
                 try:
@@ -666,12 +727,12 @@ class App(ctk.CTk):
         else:
             parts = []
             if not has_pydivert:
-                parts.append("pydivert 库")
+                parts.append("pydivert")
             if not has_driver:
-                parts.append("WinDivert 驱动")
+                parts.append("驱动文件")
             ctk.CTkLabel(
                 self._wd_status_frame,
-                text=f"缺少: {' + '.join(parts)}",
+                text=f"未安装 ({'+'.join(parts)}) - 封锁功能将降级为防火墙模式",
                 text_color="orange", font=ctk.CTkFont(size=11),
             ).pack(side="left", padx=(0, 8))
 
@@ -683,10 +744,9 @@ class App(ctk.CTk):
                 fg_color="#1a6b8a", hover_color="#155a74",
                 command=self._install_windivert,
             )
-            self._wd_install_btn.pack(side="left")
+            self._wd_install_btn.pack(side="right")
 
     def _install_windivert(self):
-        """在后台线程中安装 WinDivert"""
         self._wd_install_btn.configure(state="disabled", text="安装中...")
         self._set_status("正在安装 WinDivert...", "#aaaaff")
 
@@ -720,7 +780,7 @@ class App(ctk.CTk):
             return 0
 
     def _quit(self):
-        self.ctrl.stop_all()
+        self.ctrl.stop()
         if HAS_KEYBOARD and self._hk_registered:
             try:
                 keyboard.unhook_all_hotkeys()
