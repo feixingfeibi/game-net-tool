@@ -543,7 +543,7 @@ class App(ctk.CTk):
                 anchor="w", height=26,
                 fg_color=("#2a4a7a" if is_sel else "transparent"),
                 text_color=("#ddd", "#ccc"),
-                hover_color=("#3a3a3a",),
+                hover_color="#3a3a3a",
                 command=lambda p=proc: self._select(p),
             )
             btn.pack(fill="x", pady=1)
