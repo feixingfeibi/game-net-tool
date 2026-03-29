@@ -1,0 +1,45 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build EXE
+        run: |
+          python -m PyInstaller --noconfirm --onefile --windowed --name "GameNetTool" main.py
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: "v1.0.0 - 游戏网络工具箱"
+          body: |
+            ## 游戏网络工具箱 v1.0.0
+
+            **下载 `GameNetTool.exe` 后直接双击运行即可（需管理员权限）**
+
+            功能:
+            - 选择游戏进程，一键断网/禁上行/禁下行
+            - 自定义上下行速度限制 (KB/s)
+            - 全局快捷键 Ctrl+F9 开关
+            - WinDivert 一键安装（限速功能需要）
+          files: dist/GameNetTool.exe
