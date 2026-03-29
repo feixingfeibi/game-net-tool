@@ -5,6 +5,9 @@ echo   游戏网络工具箱 - 打包脚本
 echo ========================================
 echo.
 
+:: 切到 bat 所在目录
+cd /d "%~dp0"
+
 :: 检查 Python
 python --version >nul 2>&1
 if errorlevel 1 (
@@ -18,28 +21,27 @@ echo [1/3] 安装依赖...
 pip install -r requirements.txt pyinstaller
 echo.
 
-:: 下载 WinDivert (如果需要限速功能)
-echo [提示] 如需速度限制功能，请手动下载 WinDivert:
-echo        https://reqrypt.org/windivert.html
-echo        将 WinDivert64.sys 和 WinDivert.dll 放到 dist 目录
-echo.
-
-:: 打包
+:: 打包 (输出到当前目录)
 echo [2/3] 打包为 exe...
 pyinstaller --noconfirm --onefile --windowed ^
     --name "GameNetTool" ^
-    --add-data "requirements.txt;." ^
-    --icon NUL ^
+    --distpath "." ^
+    --workpath "build" ^
+    --specpath "build" ^
     main.py
 echo.
 
+:: 清理打包临时文件
+if exist build rd /s /q build
+if exist __pycache__ rd /s /q __pycache__
+
 :: 完成
 echo [3/3] 打包完成!
-echo 输出文件: dist\GameNetTool.exe
+echo.
+echo 输出文件: %~dp0GameNetTool.exe
 echo.
 echo 注意事项:
 echo   1. 运行时需要管理员权限
-echo   2. 如需限速功能，将 WinDivert.dll 和 WinDivert64.sys
-echo      放到 GameNetTool.exe 同目录
+echo   2. 限速功能可在程序内点击「一键安装」自动配置
 echo.
 pause
