@@ -18,12 +18,12 @@ if errorlevel 1 (
 
 :: 安装依赖
 echo [1/3] 安装依赖...
-pip install -r requirements.txt pyinstaller
+python -m pip install -r requirements.txt pyinstaller
 echo.
 
 :: 打包 (输出到当前目录)
 echo [2/3] 打包为 exe...
-pyinstaller --noconfirm --onefile --windowed ^
+python -m PyInstaller --noconfirm --onefile --windowed ^
     --name "GameNetTool" ^
     --distpath "." ^
     --workpath "build" ^
